@@ -6,12 +6,58 @@ Voice-controlled lamp using TinyML on a **Seeed XIAO ESP32S3 Sense**, plus a ser
 |---|---|
 | `lampara_light/` | Always-listening keyword spotter: says *"enciende"* -> light on, *"apaga"* -> light off (Edge Impulse model) |
 | `wav_recorder/` | Sends `rec {label}` over serial -> records 10 s WAV to microSD |
+| `relay_blink/` | Hardware test: blinks the relay pin D7 (GPIO44) open-drain, LOW 2 s (ON) / HIGH-float 2 s (OFF) |
 
 ## Hardware
 
 - Seeed XIAO ESP32S3 Sense with expansion board (PDM microphone: CLK = GPIO42, DATA = GPIO41)
-- Light: onboard user LED on **GPIO21, active-LOW** (pin LOW = LED on)
-  - GPIO21 is also the SD card chip-select on the expansion board, so the LED and the SD card cannot be used at the same time (that is why `lampara_light` is inference-only)
+- Light: relay module on header pin **D7 = GPIO44**, driven **open-drain**, active-LOW (IN pulled to GND = relay energized)
+
+  ```
+  XIAO ESP32S3 — top view (USB-C at the top)
+
+        ┌─────────────────┐
+        │    ( USB-C )    │   5V pin is only live
+        │                 │   when USB is plugged
+  5V ──►│5V            D0 │
+  GND ─►│GND           D1 │
+        │3V3           D2 │
+        │D4            D3 │
+        │D5               │
+        │D6            D8 │
+  IN ◄──┤D7            D9 │    D7 = bottom pad, left edge
+        │              D10│
+        └─────────────────┘
+  ```
+
+  Control-side wiring (3 wires):
+
+  ```
+  XIAO                     RELAY MODULE
+  ────                     ────────────
+  5V  ───────────────────►  VCC   (5V! NOT the 3V3 pin)
+  GND ───────────────────►  GND   (must share ground with XIAO)
+  D7  ───────────────────►  IN    (signal, open-drain)
+  ```
+
+  Load side (the circuit the relay switches) — use **COM + NO**:
+
+  ```
+            relay screw terminals
+
+          ┌────────────────────────┐
+          │    COM     NO     NC   │
+          └────┬──────┬──────┬─────┘
+               │      │      └── unused (closed when relay is OFF)
+   supply + ───┘      └─────── to load +
+                          (lamp/device)
+   supply - ───────────────────── to load -
+  ```
+
+  - Power the module from the **5V** pin — most 5 V relay coils will not energize from 3V3
+  - The XIAO's 5V pin is only live when powered via **USB** (dead on battery)
+  - If the relay clicks inverted (enciende turns it off), set `LIGHT_ACTIVE_LOW` to `0`
+  - **NO** = normally open (load on when the relay energizes); **NC** behaves inverted
 - microSD card, FAT32, up to 32 GB (only needed by `wav_recorder`)
 - Model: Edge Impulse impulse "Lampara" v1.0.5 — 1 s window @ 16 kHz, 16-bit mono, labels `apaga` / `enciende` / `noise` (int8 TFLite, EON). The `noise` class absorbs everything that is neither command: when it wins, nothing happens.
 
@@ -107,12 +153,22 @@ Say *"enciende"* -> `>> LIGHT ON`, *"apaga"* -> `>> LIGHT OFF`.
 
 | Define | Default | Meaning |
 |---|---|---|
-| `LIGHT_PIN` | `21` | Onboard user LED; change when wiring a relay/MOSFET |
-| `LIGHT_ACTIVE_LOW` | `1` | `1` = pin LOW turns light on (onboard LED, many relay boards); `0` = active-high |
+| `LIGHT_PIN` | `44` | Relay IN pin, header pin D7 (GPIO44), open-drain |
+| `LIGHT_ACTIVE_LOW` | `1` | `1` = pin LOW energizes the relay; `0` = active-high |
 | `LIGHT_TRIGGER_THRESHOLD` | `0.8` | Minimum confidence to trigger |
 | `LIGHT_TRIGGER_MARGIN` | `0.15` | Winner must also beat **every** other class (including `noise`) by at least this much |
 | `LIGHT_COOLDOWN_MS` | `1500` | Ignore new triggers for this long after one fires |
 | `AUDIO_GAIN` | `4` | Mic input gain. Training WAVs were recorded with x4 gain, keep in sync |
+
+### Case: relay always ON when powered from 5V (RESOLVED)
+
+Symptom: with the relay module's VCC on the **3V3** pin, the relay toggled correctly; with VCC on **5V/VBUS**, it stayed energized permanently regardless of the GPIO state.
+
+Why: the module's input is an optocoupler LED between **VCC and IN**, triggered active-LOW. A 3.3V GPIO driving HIGH against a 5V VCC still leaves 5 − 3.3 = **1.7V across the input** — enough current to keep the optocoupler (and the relay) on. On 3V3 the difference is 0V, which is why it worked there — but the relay coil is a 5V coil and is under-driven at 3V3.
+
+Resolution: the GPIO is configured as **open-drain** (`OUTPUT_OPEN_DRAIN`). LOW = pin pulled to GND → relay solidly ON; HIGH = pin floats → no voltage difference at all → relay truly OFF. VCC stays on 5V, so the coil always gets its full rated voltage. Applied to both `lampara_light` and `relay_blink`.
+
+If you ever swap to an active-HIGH module or a logic-level MOSFET board, change the `pinMode()` back to plain `OUTPUT`.
 
 ### Case: false positives with a 2-class model (RESOLVED)
 
@@ -195,5 +251,7 @@ The sketch expects the labels by name (`enciende`, `apaga`, `noise`); the `noise
 - **`ERR sd` on the recorder** — reseat the card, format FAT32 (max 32 GB), gold fingers facing inward
 - **`Error sample buffer overrun`** — the DSP cannot keep up; reduce other load or re-export a smaller window model
 - **False triggers** — see "Case: false positives with a 2-class model" above; raise `LIGHT_TRIGGER_THRESHOLD`/`LIGHT_TRIGGER_MARGIN` or retrain with a noise class
-- **Light stays off** — remember the onboard LED is active-LOW and shares GPIO21 with SD-CS
+- **Relay doesn't switch** — flash `relay_blink` (D7 blink) and bench-test: touch the IN wire directly to **GND** (should click ON on active-low modules) and to **3V3** (should release). If the manual test works but D7 doesn't, recheck the wire is on the bottom-left pad (D7/GPIO44); if the manual test fails, it's power: `VCC` must be 5V, `GND` shared with the XIAO, USB power connected
+- **Relay always ON** — see "Case: relay always ON when powered from 5V" above (open-drain output is the fix, already in the code)
+- **Sketch totally silent after wire changes / uploads behave erratically** — a wire bridging the **BOOT pad/button** holds the chip in the bootloader; check the corners near the USB connector, then press **RESET**
 - If a future Edge Impulse SDK export ever fails to compile on core 3.x, `arduino-cli core install esp32:esp32@2.0.17` provides the legacy core (the `wav_recorder` sketch requires 3.x, `lampara_light` would need its mic layer reverted to the legacy `driver/i2s.h` API from the stock EI example)

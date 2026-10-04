@@ -9,7 +9,7 @@
 #define MIC_PDM_CLK 42
 #define MIC_PDM_DATA 41
 
-#define LIGHT_PIN 21
+#define LIGHT_PIN 44
 #define LIGHT_ACTIVE_LOW 1
 #define AUDIO_GAIN 4
 #define LIGHT_TRIGGER_THRESHOLD 0.8f
@@ -138,7 +138,7 @@ void setup() {
     uint32_t t0 = millis();
     while (!Serial && millis() - t0 < 3000) delay(10);
 
-    pinMode(LIGHT_PIN, OUTPUT);
+    pinMode(LIGHT_PIN, OUTPUT_OPEN_DRAIN);
     setLight(false);
 
     ei_printf("Inferencing settings:\n");
