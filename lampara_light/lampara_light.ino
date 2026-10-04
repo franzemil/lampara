@@ -12,7 +12,7 @@
 #define LIGHT_PIN 21
 #define LIGHT_ACTIVE_LOW 1
 #define AUDIO_GAIN 4
-#define LIGHT_TRIGGER_THRESHOLD 0.9f
+#define LIGHT_TRIGGER_THRESHOLD 0.8f
 #define LIGHT_TRIGGER_MARGIN 0.15f
 #define LIGHT_COOLDOWN_MS 1500
 
@@ -178,12 +178,14 @@ void loop() {
     }
 
     if (++print_results >= (EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW)) {
-        float onScore = 0.0f, offScore = 0.0f;
+        float onScore = 0.0f, offScore = 0.0f, noiseScore = 0.0f;
         for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
             if (strcmp(result.classification[ix].label, "enciende") == 0) {
                 onScore = result.classification[ix].value;
             } else if (strcmp(result.classification[ix].label, "apaga") == 0) {
                 offScore = result.classification[ix].value;
+            } else if (strcmp(result.classification[ix].label, "noise") == 0) {
+                noiseScore = result.classification[ix].value;
             }
         }
 
@@ -198,8 +200,10 @@ void loop() {
 
         uint32_t now = millis();
         if (now - lastTriggerMs > LIGHT_COOLDOWN_MS) {
-            bool onWins = onScore >= LIGHT_TRIGGER_THRESHOLD && (onScore - offScore) >= LIGHT_TRIGGER_MARGIN;
-            bool offWins = offScore >= LIGHT_TRIGGER_THRESHOLD && (offScore - onScore) >= LIGHT_TRIGGER_MARGIN;
+            float onRunnerUp = (offScore > noiseScore) ? offScore : noiseScore;
+            float offRunnerUp = (onScore > noiseScore) ? onScore : noiseScore;
+            bool onWins = onScore >= LIGHT_TRIGGER_THRESHOLD && (onScore - onRunnerUp) >= LIGHT_TRIGGER_MARGIN;
+            bool offWins = offScore >= LIGHT_TRIGGER_THRESHOLD && (offScore - offRunnerUp) >= LIGHT_TRIGGER_MARGIN;
             if (onWins) {
                 setLight(true);
                 lastTriggerMs = now;
