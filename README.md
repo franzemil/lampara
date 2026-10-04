@@ -13,7 +13,7 @@ Voice-controlled lamp using TinyML on a **Seeed XIAO ESP32S3 Sense**, plus a ser
 - Light: onboard user LED on **GPIO21, active-LOW** (pin LOW = LED on)
   - GPIO21 is also the SD card chip-select on the expansion board, so the LED and the SD card cannot be used at the same time (that is why `lampara_light` is inference-only)
 - microSD card, FAT32, up to 32 GB (only needed by `wav_recorder`)
-- Model: Edge Impulse impulse "Lampara" v1.0.1 — 1 s window @ 16 kHz, 16-bit mono, labels `apaga` / `enciende`, int8 TFLite (EON)
+- Model: Edge Impulse impulse "Lampara" v1.0.5 — 1 s window @ 16 kHz, 16-bit mono, labels `apaga` / `enciende` / `noise` (int8 TFLite, EON). The `noise` class absorbs everything that is neither command: when it wins, nothing happens.
 
 ## Toolchain setup (arduino-cli)
 
@@ -37,14 +37,46 @@ arduino-cli config set library.enable_unsafe_install true
 Then install and verify:
 
 ```sh
-arduino-cli lib install --zip-path "ei-lampara-arduino-1.0.1-impulse-#1.zip"
+arduino-cli lib install --zip-path "ei-lampara-arduino-1.0.5-impulse-#1.zip"
 arduino-cli lib list | grep Lampara
-# Lampara_inferencing 1.0.1 ... user
+# Lampara_inferencing 1.0.5 ... user
 ```
 
 The library lands in `~/Documents/Arduino/libraries/Lampara_inferencing`.
 
 Arduino IDE alternative: **Sketch > Include Library > Add .ZIP Library...**
+
+## Updating the model (new impulse version)
+
+When you retrain in Edge Impulse Studio and export a new zip (e.g. `ei-lampara-arduino-1.0.7-impulse-#1.zip`), three steps put it on the device. **No sketch changes are needed** as long as the new model keeps the same labels (`apaga`, `enciende`, `noise`) and 1 s @ 16 kHz window — check before installing:
+
+```sh
+unzip -p "ei-lampara-arduino-1.0.7-impulse-#1.zip" \
+  "Lampara_inferencing/src/model-parameters/model_variables.h" | grep categories
+# expect: ... = { "apaga", "enciende", "noise" };
+```
+
+1. Swap the library (arduino-cli refuses to overwrite, so uninstall first):
+
+   ```sh
+   arduino-cli lib uninstall Lampara_inferencing
+   arduino-cli lib install --zip-path "ei-lampara-arduino-1.0.7-impulse-#1.zip"
+   arduino-cli lib list | grep Lampara
+   ```
+
+2. Rebuild and flash (the sketch compiles against whatever library version is installed):
+
+   ```sh
+   arduino-cli compile -u -p /dev/cu.usbmodem1101 --fqbn "esp32:esp32:XIAO_ESP32S3" lampara_light
+   ```
+
+3. Verify in the monitor — you should see three-label predictions and no false light events on ambient noise:
+
+   ```sh
+   arduino-cli monitor -p /dev/cu.usbmodem1101 -c baudrate=115200
+   ```
+
+If the new model renames or adds labels, also update the label lookups (`strcmp(..., "enciende")` etc.) in `lampara_light/lampara_light.ino`.
 
 ## lampara_light — voice-controlled light
 
@@ -77,27 +109,29 @@ Say *"enciende"* -> `>> LIGHT ON`, *"apaga"* -> `>> LIGHT OFF`.
 |---|---|---|
 | `LIGHT_PIN` | `21` | Onboard user LED; change when wiring a relay/MOSFET |
 | `LIGHT_ACTIVE_LOW` | `1` | `1` = pin LOW turns light on (onboard LED, many relay boards); `0` = active-high |
-| `LIGHT_TRIGGER_THRESHOLD` | `0.9` | Minimum confidence to trigger (raised from the model's 0.6 default, see below) |
-| `LIGHT_TRIGGER_MARGIN` | `0.15` | Winner must also beat the other class by at least this much |
+| `LIGHT_TRIGGER_THRESHOLD` | `0.8` | Minimum confidence to trigger |
+| `LIGHT_TRIGGER_MARGIN` | `0.15` | Winner must also beat **every** other class (including `noise`) by at least this much |
 | `LIGHT_COOLDOWN_MS` | `1500` | Ignore new triggers for this long after one fires |
 | `AUDIO_GAIN` | `4` | Mic input gain. Training WAVs were recorded with x4 gain, keep in sync |
 
-### Case: false positives with a 2-class model
+### Case: false positives with a 2-class model (RESOLVED)
 
-Observed on the first flash, with the model's default 0.6 threshold and no margin:
+Observed on the first flash (model v1.0.1, only `apaga`/`enciende`, 0.6 threshold, no margin):
 
 - Ambient noise scored >0.6 on `apaga` almost every second (`>> LIGHT OFF` spam — harmless but noisy logs)
 - One random noise spike scored `enciende: 0.886` and falsely turned the light **ON**
 
-Why: the model has only the two word classes, and the classifier's softmax always produces a winner. Silence, music or speech that is neither "enciende" nor "apaga" still gets pushed toward one of them.
+Why: with only the two word classes, the classifier's softmax always produces a winner. Silence, music or speech that is neither "enciende" nor "apaga" still gets pushed toward one of them.
 
-Mitigations, in order of effectiveness:
+Resolution (model v1.0.3 + current code): the model was retrained with a third `noise` class (samples collected with `wav_recorder`, see the retraining workflow below), and the trigger logic now requires a command to clear the threshold **and** beat every other class — `noise` included — by `LIGHT_TRIGGER_MARGIN`. Verified on-device: ambient noise scores `noise: 0.95+` and produces zero light events.
 
-1. **Retrain with negative samples (best fix)** — collect 1-2 minutes of ambient noise, silence and random speech/words with `wav_recorder` (`rec noise`, `rec unknown`, ...) and add them to Edge Impulse Studio as an extra class (or use the Studio's built-in noise handling). The sketch keeps working unchanged: it looks labels up by name (`enciende`/`apaga`), so a third `noise` class simply lowers the other two scores.
-2. **High threshold + margin (applied by default)** — `LIGHT_TRIGGER_THRESHOLD 0.9` and `LIGHT_TRIGGER_MARGIN 0.15` block mid-confidence noise like the `0.886` false ON above.
-3. **Cooldown** — `LIGHT_COOLDOWN_MS` limits how often a trigger can fire at all.
+Remaining tuning knobs if false triggers ever come back:
 
-If real utterances start getting missed (model not confident enough on your voice), lower the threshold to 0.8 or the margin to 0.1 and retest.
+1. **Retrain with more negative samples** — collect 1-2 minutes more of ambient noise, silence and random speech with `wav_recorder` and add them to the `noise` class
+2. **Raise threshold/margin** — e.g. `LIGHT_TRIGGER_THRESHOLD 0.9`, `LIGHT_TRIGGER_MARGIN 0.2`
+3. **Cooldown** — `LIGHT_COOLDOWN_MS` limits how often a trigger can fire at all
+
+If real utterances start getting missed (model not confident enough on your voice), lower the threshold to 0.7 or the margin to 0.1 and retest.
 
 ## wav_recorder — training data collector
 
@@ -148,19 +182,11 @@ Wait for `DONE /noiseX.wav 320044 bytes` before the next command; anything sent 
 ### 2. Upload, retrain, redeploy
 
 1. Power off, take the microSD out, and copy the WAVs to your computer (card reader)
-2. Upload them to Edge Impulse Studio (project "Lampara") under the matching labels — noise/unknown clips go to a new class (e.g. `noise`)
+2. Upload them to Edge Impulse Studio (project "Lampara") under the matching labels — noise/unknown clips go to the `noise` class
 3. Retrain and export the **Arduino library** zip
-4. Install the new zip (uninstall first, arduino-cli refuses to overwrite):
-   ```sh
-   arduino-cli lib uninstall Lampara_inferencing
-   arduino-cli lib install --zip-path "ei-lampara-arduino-X.Y.Z-impulse-N.zip"
-   ```
-5. Flash the light sketch again and test:
-   ```sh
-   arduino-cli compile -u -p /dev/cu.usbmodem1101 --fqbn "esp32:esp32:XIAO_ESP32S3" lampara_light
-   ```
+4. Follow **"Updating the model (new impulse version)"** above to install it and reflash
 
-The sketch needs no code changes for a third class: it looks labels up by name, so a `noise` class simply lowers the `enciende`/`apaga` scores on non-command audio.
+The sketch expects the labels by name (`enciende`, `apaga`, `noise`); the `noise` class must exist in the model — when it wins a window, no action is taken.
 
 ## Troubleshooting
 
