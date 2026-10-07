@@ -54,7 +54,7 @@ Each command records 10 s to the microSD and answers `DONE /noiseX.wav 320044 by
 
 ### 2. Download the model, compile and flash (`lampara_light`)
 
-The model comes as an Arduino library zip from Edge Impulse (project "Lampara"). Install it, then compile and send to the board:
+The model comes as an Arduino library zip from Edge Impulse (project "Lampara") — or as a **locally-trained model** injected into the library ([docs/self-training.md](docs/self-training.md)). Install it, then compile and send to the board:
 
 ```sh
 arduino-cli lib install --zip-path "ei-lampara-arduino-1.0.8-impulse-#1.zip"
@@ -73,4 +73,5 @@ The monitor prints one prediction line per second; say *"enciende"* -> `>> LIGHT
 | [docs/lampara_light.md](docs/lampara_light.md) | Monitor output, tuning defines, resolved hardware/model cases |
 | [docs/wav_recorder.md](docs/wav_recorder.md) | Recorder serial commands, PSRAM requirement, SD handling |
 | [docs/retraining.md](docs/retraining.md) | Full retraining loop: record -> upload -> retrain -> reflash |
+| [docs/self-training.md](docs/self-training.md) | Local model training (EI-compatible, no Studio needed) |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Ports, SD errors, relay issues, bootloader recovery |

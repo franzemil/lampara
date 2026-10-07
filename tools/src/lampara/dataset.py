@@ -84,3 +84,38 @@ def write_wav(path: Path, values: list[int], samplerate: int = 16000) -> Path:
     data = np.clip(np.asarray(values, dtype=np.int32), -32768, 32767).astype("<i2")
     sf.write(str(path), data, samplerate, subtype="PCM_16")
     return path
+
+
+def dcfix(
+    dataset_dir: Path,
+    labels: tuple[str, ...],
+    dither_std: float = 40.0,
+    mean_threshold: float = 100.0,
+    seed: int | None = None,
+) -> int:
+    """Remove DC offset and add dither so EI's MFCC never hits log(0) (NaN -> DSP error -5)."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    fixed = 0
+    for label in labels:
+        folder = dataset_dir / label
+        if not folder.is_dir():
+            continue
+        for wav in sorted(folder.glob("*.wav")):
+            if wav.stem.startswith("aug_"):
+                continue
+            data, sr = sf.read(str(wav), dtype="int16")
+            f = data.astype(np.float64)
+            mean = float(f.mean())
+            std = float(f.std())
+            if abs(mean) <= mean_threshold and std > 1.0:
+                continue
+            f = f - mean
+            if std <= 1.0:
+                f = f + rng.normal(0, dither_std, f.shape)
+            f = f + rng.normal(0, dither_std * 0.25, f.shape)
+            out = np.clip(f, -32768, 32767).astype("<i2")
+            sf.write(str(wav), out, sr, subtype="PCM_16")
+            fixed += 1
+    return fixed

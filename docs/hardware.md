@@ -59,3 +59,22 @@ Notes:
 - **NO** = normally open (load on when the relay energizes); **NC** behaves inverted
 
 See [troubleshooting.md](troubleshooting.md) for the "relay always ON on 5V" case (open-drain fix, already in the code).
+
+## Standalone power (HLK-PM01)
+
+The [HLK-PM01](https://www.hlktech.net/) is an AC-DC module: mains 90–264 VAC in → **5 V DC @ 600 mA** out. It makes the lamp run without a USB cable (fixes the "5V dead without USB" limitation above).
+
+```
+MAINS (DANGER)             HLK-PM01                XIAO ESP32S3
+──────────────             ─────────               ─────────────
+Live (L) ──[FUSE]───────►  AC (L)
+Neutral (N) ─────────────► AC (N)
+
+                           +Vo (5V DC) ──────────► 5V pin (VBUS)
+                           -Vo (GND)   ──────────►  GND pin
+```
+
+- DC side: `+Vo` → XIAO **5V** pin, `-Vo` → XIAO **GND**. Never into 3V3.
+- 600 mA covers the XIAO (~50 mA) + relay module (~80 mA) with headroom — power the relay VCC from the same 5V rail.
+- USB can stay connected for the serial monitor: the XIAO has a diode between VBUS and the 5V pin, so the HLK will not back-feed the computer.
+- **Mains safety**: fuse the Live wire, enclose everything insulated, and never touch the AC side while powered. The relay's load side (mains through COM + NO) needs the same protection.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import typer
@@ -9,6 +10,7 @@ import typer
 from . import config, dataset, ffmpeg, noise, tts
 from .augment import augment_dataset, plan_variants
 from .ei_api import EdgeImpulseClient
+from . import native
 
 app = typer.Typer(help="Tooling for the lampara-aliz voice-controlled lamp.", no_args_is_help=True)
 dataset_app = typer.Typer(help="Local dataset utilities.", no_args_is_help=True)
@@ -16,12 +18,14 @@ noise_app = typer.Typer(help="Synthetic noise generation.", no_args_is_help=True
 tts_app = typer.Typer(help="TTS sample generation (macOS say).", no_args_is_help=True)
 ei_app = typer.Typer(help="Edge Impulse Studio data management.", no_args_is_help=True)
 augment_app = typer.Typer(help="Audio augmentation pipeline.", no_args_is_help=True)
+local_app = typer.Typer(help="Local (on-Mac) inference of the current model.", no_args_is_help=True)
 
 app.add_typer(dataset_app, name="dataset")
 app.add_typer(noise_app, name="noise")
 app.add_typer(tts_app, name="tts")
 app.add_typer(ei_app, name="ei")
 app.add_typer(augment_app, name="augment")
+app.add_typer(local_app, name="local")
 
 
 def _client(project_id: int | None) -> EdgeImpulseClient:
@@ -207,6 +211,14 @@ def ei_upload(
     raise typer.Exit(result.returncode)
 
 
+def _resolve_model_zip() -> Path:
+    zips = sorted(Path(".").glob("ei-lampara-arduino-*-impulse-#1.zip"))
+    if not zips:
+        typer.secho("no ei-lampara-arduino-*-impulse-#1.zip in the repo root", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1)
+    return zips[-1]
+
+
 @augment_app.command("plan")
 def augment_plan(
     variants: int = typer.Option(4, "--variants", "-n"),
@@ -240,6 +252,207 @@ def augment_run(
     )
     suffix = " (dry-run)" if dry_run else ""
     print(f"created {len(created)} augmented clips{suffix}")
+
+
+@dataset_app.command("dcfix")
+def dataset_dcfix(
+    seed: int = typer.Option(None, "--seed"),
+) -> None:
+    """Remove DC offset + add dither to originals (fixes EI MFCC DSP error -5)."""
+    fixed = dataset.dcfix(config.DATASET_DIR, config.LABELS, seed=seed)
+    print(f"fixed {fixed} files")
+
+
+@ei_app.command("prune-failing")
+def ei_prune_failing(
+    yes: bool = typer.Option(False, "--yes"),
+    version: str = typer.Option(None, "--version"),
+    project_id: int = typer.Option(None, "--project"),
+) -> None:
+    """Evaluate local originals and delete the DSP-failing samples from Studio."""
+    import json as _json
+
+    zip_path = _resolve_model_zip()
+    version = version or zip_path.name.split("-arduino-")[1].split("-")[0]
+    binary = native.build(zip_path, version)
+    pairs = native.collect_eval_files(config.DATASET_DIR, config.LABELS)
+    rows = native.classify(binary, [p for p, _ in pairs])
+    failing = [Path(r["file"]).name for r in rows if "error" in r]
+    if not failing:
+        print("no DSP-failing files")
+        return
+    client = _client(project_id)
+    ids: list[tuple[int, str]] = []
+    for category in config.CATEGORIES:
+        for s in client.list_samples(category):
+            if s.filename in failing:
+                ids.append((s.id, s.filename))
+    print(f"{len(failing)} failing local files -> {len(ids)} studio samples:")
+    for sid, fn in ids[:10]:
+        print(f"  {sid} {fn}")
+    if len(ids) > 10:
+        print(f"  ... and {len(ids) - 10} more")
+    if not ids:
+        return
+    if not yes:
+        if not typer.confirm(f"delete {len(ids)} studio samples?"):
+            raise typer.Abort()
+    for sid, _ in ids:
+        client.delete_sample(sid)
+    print(f"deleted {len(ids)} samples")
+
+
+@local_app.command("build")
+def local_build(
+    force: bool = typer.Option(False, "--force"),
+    version: str = typer.Option(None, "--version"),
+) -> None:
+    """Extract the model zip and compile the native classify binary."""
+    zip_path = _resolve_model_zip()
+    version = version or zip_path.name.split("-arduino-")[1].split("-")[0]
+    try:
+        binary = native.build(zip_path, version, force=force)
+    except native.BuildError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1)
+    print(f"built: {binary}")
+
+
+@local_app.command("classify")
+def local_classify(
+    files: list[Path] = typer.Argument(..., exists=True),
+    version: str = typer.Option(None, "--version"),
+) -> None:
+    """Classify local WAV files with the native binary (JSON scores)."""
+    zip_path = _resolve_model_zip()
+    version = version or zip_path.name.split("-arduino-")[1].split("-")[0]
+    binary = native.build(zip_path, version)
+    for row in native.classify(binary, files):
+        typer.echo(json.dumps(row))
+
+
+@local_app.command("evaluate")
+def local_evaluate(
+    threshold: float = typer.Option(0.8, "--threshold"),
+    margin: float = typer.Option(0.15, "--margin"),
+    sweep: bool = typer.Option(True, "--sweep/--no-sweep"),
+    apply: bool = typer.Option(False, "--apply", help="write best threshold/margin into lampara_light.ino"),
+    version: str = typer.Option(None, "--version"),
+) -> None:
+    """Classify all project recordings in dataset/ and report accuracy + best thresholds."""
+    import json as _json
+
+    zip_path = _resolve_model_zip()
+    version = version or zip_path.name.split("-arduino-")[1].split("-")[0]
+    binary = native.build(zip_path, version)
+    pairs = native.collect_eval_files(config.DATASET_DIR, config.LABELS)
+    if not pairs:
+        typer.secho("dataset/ has no evaluation files — run `ei download` first", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1)
+    rows = native.classify(binary, [p for p, _ in pairs])
+    report = native.evaluate_rows(rows, config.LABELS, threshold, margin)
+
+    print(f"evaluated: {len(pairs)} files (dsp errors: {len(report['errors'])})")
+    if report["errors"]:
+        print("DSP-failing files (delete these from Studio):")
+        for name in report["errors"]:
+            print(f"  {name}")
+    print("\nconfusion (rows=true, cols=predicted):")
+    labels = list(config.LABELS) + ["none"]
+    header = "true\\pred  " + "  ".join(f"{c:>9}" for c in labels)
+    print(header)
+    for t in config.LABELS:
+        cells = "  ".join(f"{report['confusion'][t].get(c, 0):>9}" for c in labels)
+        print(f"{t:<10} {cells}")
+    print(f"\nkeyword recall: {report['keyword_recall']:.1%} | noise rejection: {report['noise_rejection']:.1%} (threshold={threshold}, margin={margin})")
+
+    if sweep:
+        import numpy as np
+
+        thresholds = [round(x, 2) for x in np.arange(0.50, 0.96, 0.05)]
+        margins = [round(x, 2) for x in np.arange(0.00, 0.31, 0.05)]
+        results = native.sweep(rows, config.LABELS, thresholds, margins)
+        print("\nbest operating points (score = 0.5*kw_recall + 0.5*noise_rejection):")
+        for r in results[:5]:
+            print(
+                f"  threshold={r['threshold']:.2f} margin={r['margin']:.2f} -> "
+                f"kw_recall={r['keyword_recall']:.1%} noise_rej={r['noise_rejection']:.1%} score={r['score']:.3f}"
+            )
+        best = results[0]
+        if apply:
+            ino = Path("lampara_light/lampara_light.ino")
+            text = ino.read_text()
+            text = text.replace(
+                f"#define LIGHT_TRIGGER_THRESHOLD {threshold}f",
+                f"#define LIGHT_TRIGGER_THRESHOLD {best['threshold']}f",
+            )
+            text = text.replace(
+                f"#define LIGHT_TRIGGER_MARGIN {margin}f",
+                f"#define LIGHT_TRIGGER_MARGIN {best['margin']}f",
+            )
+            ino.write_text(text)
+            print(f"applied threshold={best['threshold']} margin={best['margin']} to lampara_light.ino")
+
+
+@local_app.command("features")
+def local_features(
+    out: Path = typer.Option(Path("dataset/features.npz"), "--out"),
+    originals_only: bool = typer.Option(False, "--originals-only", help="skip aug_* files"),
+    project_id: int = typer.Option(None, "--project"),
+) -> None:
+    """Dump EI MFCC features for dataset recordings into an .npz for training."""
+    zip_path = _resolve_model_zip()
+    version = zip_path.name.split("-arduino-")[1].split("-")[0]
+    binary = native.build(zip_path, version)
+    pairs: list[tuple[Path, str]] = []
+    for label in config.LABELS:
+        folder = config.DATASET_DIR / label
+        if not folder.is_dir():
+            continue
+        for wav in sorted(folder.glob("*.wav")):
+            if originals_only and wav.stem.startswith("aug_"):
+                continue
+            pairs.append((wav, label))
+    if not pairs:
+        typer.secho("dataset/ has no files — run `ei download` first", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1)
+    rows = native.classify(binary, [p for p, _ in pairs], features=True)
+    import numpy as np
+
+    kept = [(r, l) for r, (_, l) in zip(rows, pairs) if "features" in r]
+    xs = np.asarray([r["features"] for r, _ in kept], dtype=np.float32)
+    ys = np.asarray([l for _, l in kept])
+    files = np.asarray([r["file"] for r, _ in kept])
+    np.savez_compressed(out, features=xs, labels=ys, files=files)
+    print(f"saved {xs.shape} features to {out} (labels: {np.unique(ys, return_counts=True)})")
+
+
+tflite_app = typer.Typer(help="Inject a locally-trained TFLite model into the EI library.", no_args_is_help=True)
+app.add_typer(tflite_app, name="tflite")
+
+
+@tflite_app.command("inject")
+def tflite_inject(
+    model: Path = typer.Argument(..., exists=True, help="int8 .tflite flatbuffer"),
+    arena: int = typer.Option(32768, "--arena", help="tensor arena size in bytes"),
+    install: bool = typer.Option(False, "--install", help="also patch the installed Arduino library"),
+    version: str = typer.Option(None, "--version"),
+) -> None:
+    """Swap a locally-trained int8 model into the EI library (switches to the TFLM engine)."""
+    from . import tflite as tflite_mod
+
+    zip_path = _resolve_model_zip()
+    version = version or zip_path.name.split("-arduino-")[1].split("-")[0]
+    src = native.extract_library(zip_path, version)
+    tflite_mod.inject(model, src, arena_size=arena)
+    print(f"injected {model.name} into harness copy: {src}")
+    if install:
+        lib = Path.home() / "Documents" / "Arduino" / "libraries" / "Lampara_inferencing" / "src"
+        if not lib.is_dir():
+            typer.secho(f"installed library not found at {lib}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(1)
+        tflite_mod.inject(model, lib, arena_size=arena)
+        print(f"injected into installed library: {lib}")
 
 
 if __name__ == "__main__":

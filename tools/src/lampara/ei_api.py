@@ -93,7 +93,7 @@ class EdgeImpulseClient:
         resp = self._session.delete(
             f"{self.settings.base_url}/raw-data/{sample_id}",
             headers=self._headers,
-            timeout=30,
+            timeout=120,
         )
         resp.raise_for_status()
         try:
